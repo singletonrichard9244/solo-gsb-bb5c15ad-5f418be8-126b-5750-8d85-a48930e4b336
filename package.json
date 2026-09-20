@@ -1,0 +1,19 @@
+{
+  "name": "shortcut-review-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "上下文快捷键审校台：上下文树 + 最近祖先生效绑定 + 冲突检测 + 逐键模拟",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c cyan,magenta \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w client",
+    "start": "node server/src/index.js",
+    "test:engine": "node server/test/engine.test.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

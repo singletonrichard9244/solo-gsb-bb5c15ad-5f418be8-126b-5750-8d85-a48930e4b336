@@ -1,0 +1,13 @@
+services:
+  shortcut-console:
+    build: .
+    image: shortcut-review-console:latest
+    container_name: shortcut-review-console
+    ports:
+      - "3000:3000"
+    volumes:
+      - shortcut-data:/app/server/data
+    restart: unless-stopped
+
+volumes:
+  shortcut-data:

@@ -1,0 +1,245 @@
+{
+  "contexts": [
+    {
+      "id": "ctx-app",
+      "parentId": null,
+      "name": "App",
+      "description": "整个应用（全局快捷键）"
+    },
+    {
+      "id": "ctx-editor",
+      "parentId": "ctx-app",
+      "name": "Editor",
+      "description": "通用编辑器上下文"
+    },
+    {
+      "id": "ctx-code",
+      "parentId": "ctx-editor",
+      "name": "Code Editor",
+      "description": "代码编辑器（支持多光标/LSP）"
+    },
+    {
+      "id": "ctx-terminal",
+      "parentId": "ctx-editor",
+      "name": "Terminal",
+      "description": "内嵌终端上下文"
+    }
+  ],
+  "commands": [
+    {
+      "id": "cmd-1",
+      "contextId": "ctx-app",
+      "name": "打开命令面板",
+      "sequenceRaw": "ctrl+shift+p",
+      "sequenceTokens": [
+        "ctrl+shift+p"
+      ],
+      "sequenceLabel": "ctrl+shift+p",
+      "description": "全局命令面板"
+    },
+    {
+      "id": "cmd-2",
+      "contextId": "ctx-app",
+      "name": "快速打开文件",
+      "sequenceRaw": "ctrl+p",
+      "sequenceTokens": [
+        "ctrl+p"
+      ],
+      "sequenceLabel": "ctrl+p",
+      "description": ""
+    },
+    {
+      "id": "cmd-3",
+      "contextId": "ctx-app",
+      "name": "保存",
+      "sequenceRaw": "ctrl+s",
+      "sequenceTokens": [
+        "ctrl+s"
+      ],
+      "sequenceLabel": "ctrl+s",
+      "description": ""
+    },
+    {
+      "id": "cmd-4",
+      "contextId": "ctx-app",
+      "name": "聚焦下一个面板",
+      "sequenceRaw": "ctrl+j",
+      "sequenceTokens": [
+        "ctrl+j"
+      ],
+      "sequenceLabel": "ctrl+j",
+      "description": ""
+    },
+    {
+      "id": "cmd-5",
+      "contextId": "ctx-editor",
+      "name": "撤销",
+      "sequenceRaw": "ctrl+z",
+      "sequenceTokens": [
+        "ctrl+z"
+      ],
+      "sequenceLabel": "ctrl+z",
+      "description": ""
+    },
+    {
+      "id": "cmd-6",
+      "contextId": "ctx-editor",
+      "name": "查找",
+      "sequenceRaw": "ctrl+f",
+      "sequenceTokens": [
+        "ctrl+f"
+      ],
+      "sequenceLabel": "ctrl+f",
+      "description": ""
+    },
+    {
+      "id": "cmd-7",
+      "contextId": "ctx-editor",
+      "name": "转到行",
+      "sequenceRaw": "ctrl+g",
+      "sequenceTokens": [
+        "ctrl+g"
+      ],
+      "sequenceLabel": "ctrl+g",
+      "description": ""
+    },
+    {
+      "id": "cmd-8",
+      "contextId": "ctx-editor",
+      "name": "跳转…",
+      "sequenceRaw": "g",
+      "sequenceTokens": [
+        "g"
+      ],
+      "sequenceLabel": "g",
+      "description": "Vim 风格跳转前缀，在子上下文会被覆盖"
+    },
+    {
+      "id": "cmd-9",
+      "contextId": "ctx-editor",
+      "name": "复制整行",
+      "sequenceRaw": "ctrl+c",
+      "sequenceTokens": [
+        "ctrl+c"
+      ],
+      "sequenceLabel": "ctrl+c",
+      "description": ""
+    },
+    {
+      "id": "cmd-10",
+      "contextId": "ctx-code",
+      "name": "跳转定义…",
+      "sequenceRaw": "g",
+      "sequenceTokens": [
+        "g"
+      ],
+      "sequenceLabel": "g",
+      "description": "跳转前缀（与 G D、G D D 形成前缀冲突）"
+    },
+    {
+      "id": "cmd-11",
+      "contextId": "ctx-code",
+      "name": "跳到类型定义",
+      "sequenceRaw": "g d",
+      "sequenceTokens": [
+        "g",
+        "d"
+      ],
+      "sequenceLabel": "g d",
+      "description": ""
+    },
+    {
+      "id": "cmd-12",
+      "contextId": "ctx-code",
+      "name": "跳到声明",
+      "sequenceRaw": "g d d",
+      "sequenceTokens": [
+        "g",
+        "d",
+        "d"
+      ],
+      "sequenceLabel": "g d d",
+      "description": ""
+    },
+    {
+      "id": "cmd-13",
+      "contextId": "ctx-code",
+      "name": "重命名符号",
+      "sequenceRaw": "f2",
+      "sequenceTokens": [
+        "f2"
+      ],
+      "sequenceLabel": "f2",
+      "description": ""
+    },
+    {
+      "id": "cmd-14",
+      "contextId": "ctx-code",
+      "name": "向下添加光标",
+      "sequenceRaw": "ctrl+alt+d",
+      "sequenceTokens": [
+        "ctrl+alt+d"
+      ],
+      "sequenceLabel": "ctrl+alt+d",
+      "description": ""
+    },
+    {
+      "id": "cmd-15",
+      "contextId": "ctx-terminal",
+      "name": "清屏前缀（覆盖祖先）",
+      "sequenceRaw": "g",
+      "sequenceTokens": [
+        "g"
+      ],
+      "sequenceLabel": "g",
+      "description": "覆盖 Editor 的“跳转…”（最近祖先规则）"
+    },
+    {
+      "id": "cmd-16",
+      "contextId": "ctx-terminal",
+      "name": "清屏",
+      "sequenceRaw": "g l",
+      "sequenceTokens": [
+        "g",
+        "l"
+      ],
+      "sequenceLabel": "g l",
+      "description": "与 G 构成前缀冲突（跨层前缀链中的一段）"
+    },
+    {
+      "id": "cmd-17",
+      "contextId": "ctx-terminal",
+      "name": "清屏并回顶部",
+      "sequenceRaw": "g h",
+      "sequenceTokens": [
+        "g",
+        "h"
+      ],
+      "sequenceLabel": "g h",
+      "description": ""
+    },
+    {
+      "id": "cmd-18",
+      "contextId": "ctx-terminal",
+      "name": "清屏并回底部",
+      "sequenceRaw": "g h",
+      "sequenceTokens": [
+        "g",
+        "h"
+      ],
+      "sequenceLabel": "g h",
+      "description": "同层重复绑定，演示 duplicate 冲突"
+    },
+    {
+      "id": "cmd-19",
+      "contextId": "ctx-terminal",
+      "name": "新建终端",
+      "sequenceRaw": "ctrl+`",
+      "sequenceTokens": [
+        "ctrl+`"
+      ],
+      "sequenceLabel": "ctrl+`",
+      "description": ""
+    }
+  ]
+}
