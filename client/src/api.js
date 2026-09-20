@@ -6,7 +6,13 @@ async function request(path, options = {}) {
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(data.error || `请求失败 (${res.status})`);
+    err.status = res.status;
+    err.code = data.code || null;
+    err.info = data.details || null;
+    throw err;
+  }
   return data;
 }
 
@@ -26,6 +32,11 @@ export const api = {
   regressionSuite: () => request('/regression-suite'),
   sandboxPreview: (draft) =>
     request('/sandbox/preview', { method: 'POST', body: JSON.stringify(draft) }),
+  sandboxPublish: (draft, baselineFingerprint) =>
+    request('/sandbox/publish', {
+      method: 'POST',
+      body: JSON.stringify({ draft, baselineFingerprint }),
+    }),
   resolveConflicts: (contextId, body) =>
     request(`/conflicts/resolve/${contextId}`, { method: 'POST', body: JSON.stringify(body) }),
 };

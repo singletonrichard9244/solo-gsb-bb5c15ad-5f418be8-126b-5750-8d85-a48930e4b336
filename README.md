@@ -1,6 +1,6 @@
 # ⌨ 上下文快捷键审校台（Node.js + React）
 
-为命令式快捷键体系提供的可视化审校工具：建立**上下文树**，为命令指定所属上下文与由 **1～3 次按键**组成的序列；选择任一上下文后，系统按**最近祖先规则**构建生效绑定，自动标出**同层重复**与**前缀冲突**，并提供**逐键模拟器**实时查看候选、触发与等待状态。模拟器内含**时序回放**：录制带相对毫秒与可配置超时阈值的按键时间线，短序列既是精确命中又是长序列前缀时先进入待定，阈值内续键触发长序列、超时触发短序列，无匹配则从当前按键重新起算不吞键，并支持 JSON 导入/导出。此外可一键**生成回归测试套件**：以全部叶子上下文为候选，用精确集合覆盖选出叶子数量最少的测试上下文集合。新增的**变更沙盒**支持把命令的新增、改序列、删除先暂存为浏览器本地草案，后端在同一份草案上预演基线与模拟状态，按上下文汇总各项差异，改动确认前不触碰任何真实数据。审校页的**冲突消解**面板可针对当前上下文的生效 duplicate/prefix 冲突自动搜索改键方案：锁定不可改命令、提供候选序列池与改动上限后，后端仅改动当前上下文定义的命令，复用生效规则精确求解，依次最小化改动命令数、总按键数与方案字典序；无解时逐个列出无法消除的冲突与原因，有解时一键把全部改键写入沙盒草案继续预演。
+为命令式快捷键体系提供的可视化审校工具：建立**上下文树**，为命令指定所属上下文与由 **1～3 次按键**组成的序列；选择任一上下文后，系统按**最近祖先规则**构建生效绑定，自动标出**同层重复**与**前缀冲突**，并提供**逐键模拟器**实时查看候选、触发与等待状态。模拟器内含**时序回放**：录制带相对毫秒与可配置超时阈值的按键时间线，短序列既是精确命中又是长序列前缀时先进入待定，阈值内续键触发长序列、超时触发短序列，无匹配则从当前按键重新起算不吞键，并支持 JSON 导入/导出。此外可一键**生成回归测试套件**：以全部叶子上下文为候选，用精确集合覆盖选出叶子数量最少的测试上下文集合。新增的**变更沙盒**支持把命令的新增、改序列、删除先暂存为浏览器本地草案，后端在同一份草案上预演基线与模拟状态（预演响应携带**基线版本指纹**），按上下文汇总各项差异，改动确认前不触碰任何真实数据；确认无误后可**一键发布草案**——仅已成功预演且无新增 duplicate/prefix 冲突的草案可发布，后端在单次临界区内重新核对指纹、复用草案校验并原子写入，数据已变化时拒绝发布并返回当前版本与失效操作（绝不部分落盘），成功后清空本地草案并展示新增/改序列/删除数量。审校页的**冲突消解**面板可针对当前上下文的生效 duplicate/prefix 冲突自动搜索改键方案：锁定不可改命令、提供候选序列池与改动上限后，后端仅改动当前上下文定义的命令，复用生效规则精确求解，依次最小化改动命令数、总按键数与方案字典序；无解时逐个列出无法消除的冲突与原因，有解时一键把全部改键写入沙盒草案继续预演。
 
 ## 一条命令启动（Docker Compose）
 
@@ -35,7 +35,9 @@ npm run dev          # 并行启动后端(3000) 与 Vite 前端(5173)
 ```bash
 npm run build        # 构建前端到 client/dist
 npm start            # 仅启动后端；若已 build，则由后端在 3000 端口托管前端
-npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前缀 / 逐键模拟 / 回归套件 / 沙盒预演 / 冲突消解）
+npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前缀 / 逐键模拟 / 回归套件 / 沙盒预演 / 版本指纹 / 冲突消解）
+npm run test:publish # 运行沙盒发布接口测试（HTTP + 临时数据目录：指纹核对 / 409 / 并发临界区 / 原子落盘）
+npm test             # 依次运行以上两套测试
 ```
 
 ## 数据模型
@@ -129,15 +131,31 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
    （目标命令/上下文已不存在），页面会提示并自动剔除。
 2. **预演**：草案非空时自动调用 `POST /api/sandbox/preview`（也可手动重新预演）。后端在同一份草案上
    分别计算**基线**（当前状态）与**模拟状态**（应用草案后的内存副本，绝不写回），复用与审校页完全
-   相同的生效规则，按上下文汇总以下各项的**新增 / 消失**：
+   相同的生效规则，按上下文汇总以下各项的**新增 / 消失**；响应同时携带基线**版本指纹**
+   `baseline.fingerprint`（按 id 排序后对上下文树/命令实质内容取 SHA-256，与数据条目顺序无关）：
    - **生效绑定**（以「命令 + 序列」配对：改序列表现为旧绑定消失、新绑定出现）；
    - **shadowed**（被更近祖先同序列绑定覆盖的条目）；
    - **duplicate / prefix 冲突**（以**参与命令集合**的稳定身份配对：参与集合与角色不变的冲突
      不计差异；集合变化则旧身份消失、新身份出现）；
    - **不可触发命令**（全局汇总：任何叶子都无法触发的命令，附原因）。
 3. **差异展示**：每项差异都给出**来源路径**（定义所在上下文路径）与**最短触发输入**，草案引入的
-   条目带有「草案新增 / 改序列 / 删除」标记；绿色 ＋ 表示新增、红色 − 表示消失。
-4. **导出**：可一键**下载预演 JSON**（与 `POST /api/sandbox/preview` 返回内容一致）。
+   条目带有「草案新增 / 改序列 / 删除」标记；绿色 ＋ 表示新增、红色 − 表示消失。预演统计中
+   duplicate / prefix 的**新增**数量大于 0 时，页面明确标红且禁止发布。
+4. **发布草案**（`POST /api/sandbox/publish`）：只有**已成功预演**（预演与当前草案一致）且
+   **无新增 duplicate/prefix 冲突**的草案可发布。发布请求回传预演得到的基线指纹，后端在
+   **单次写临界区**（全部写接口共用同一把内存锁）内依次完成：
+   1. **重新核对指纹**：当前状态指纹与预演时不一致则拒绝（`409 BASELINE_CHANGED`），响应给出
+      **当前版本**（指纹/上下文数/命令数）与逐条**失效操作**（目标上下文/命令已消失的 adds/
+      updates/deletes），前端保留草案、刷新最新数据并自动重新预演；
+   2. **复用草案校验**：`applyDraft` + `previewSandbox` 原样复用，模拟状态出现任何**新增**
+      duplicate/prefix 冲突则拒绝（`409 DRAFT_CONFLICTS`，附带冲突所在上下文、身份与参与命令）；
+   3. **原子写入**：全部校验通过后才更新内存状态，以 `state.json.tmp` + `rename` 单次原子落盘；
+      新增命令由服务端分配真实 `cmd-<uuid>`（前端 draftId 不会落盘）。
+   任何拒绝路径都在修改内存状态之前返回——**绝不部分落盘**；失败时浏览器中的草案原样保留，
+   可调整后重新预演。发布**成功**后清空本地草案、刷新审校页状态，并展示
+   **新增 / 改序列 / 删除数量**与新基线指纹。并发的两个发布会被临界区串行化：恰好一个成功，
+   另一个收到 `409 BASELINE_CHANGED`，最终状态只可能是其中一个草案的结果。
+5. **导出**：可一键**下载预演 JSON**（与 `POST /api/sandbox/preview` 返回内容一致）。
 
 预演结果完全确定：全部输出按稳定键排序，与数据文件中的顺序、草案操作的先后顺序无关。
 
@@ -152,7 +170,8 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
 | POST | `/api/simulate/:contextId` | 逐键模拟，body：`{"buffer":["g","d"]}` 或 `{"presses":"g d"}` |
 | POST | `/api/replay/:contextId` | 时序回放（只读）：body 为带时间戳的按键时间线，返回逐事件状态、超时事件与最终触发命令及时间点；加 `?download=1` 返回附件响应头 |
 | GET | `/api/regression-suite` | 回归套件（统计 + 入选用例 + 候选覆盖数 + 不可触发命令原因）；加 `?download=1` 返回 `Content-Disposition: attachment` 响应头 |
-| POST | `/api/sandbox/preview` | 变更沙盒预演（只读，不写数据文件）：body 为草案，返回基线 vs 模拟状态的按上下文差异；加 `?download=1` 返回附件响应头 |
+| POST | `/api/sandbox/preview` | 变更沙盒预演（只读，不写数据文件）：body 为草案，返回基线指纹与基线 vs 模拟状态的按上下文差异；加 `?download=1` 返回附件响应头 |
+| POST | `/api/sandbox/publish` | 变更沙盒发布（写临界区）：body 为 `{draft, baselineFingerprint}`（草案字段也可置于顶层）；基线已变化返回 `409 BASELINE_CHANGED`，新增冲突返回 `409 DRAFT_CONFLICTS`，成功原子落盘并返回新增/改序列/删除数量 |
 | POST | `/api/conflicts/resolve/:contextId` | 冲突消解（只读）：仅改动当前上下文命令，按候选池/锁定/改动上限搜索无冲突改键方案；加 `?download=1` 返回附件响应头 |
 
 `POST /api/sandbox/preview` 请求体（三类操作均可选，默认为空）：
@@ -168,8 +187,14 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
 返回结构：
 
 ```jsonc
+```jsonc
 {
+  "format": "shortcut-sandbox-preview-v1",
   "generatedAt": "…",
+  "baseline": {
+    "fingerprint": "sha256:…",            // 基线版本指纹：发布时须原样回传
+    "contextCount": 4, "commandCount": 19
+  },
   "draft": { "adds": 1, "updates": 1, "deletes": 1,
              "addedCommandIds": ["draft-x1"], "updatedCommandIds": ["cmd-16"], "deletedCommandIds": ["cmd-10"] },
   "stats": {
@@ -201,6 +226,52 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
   参与方按命令 id 排序并各带来源路径与最短触发输入。
 
 草案非法（序列不合法、命令/上下文不存在、重复操作、改已删除命令等）时返回 `400` 与错误说明，不产生任何副作用。
+
+`POST /api/sandbox/publish` 请求体：
+
+```jsonc
+{
+  "draft": {
+    "adds":    [ { "draftId": "draft-x1", "contextId": "ctx-terminal", "name": "新命令", "sequence": "g w" } ],
+    "updates": [ { "commandId": "cmd-16", "sequence": "g l l" } ],
+    "deletes": [ "cmd-10" ]
+  },
+  "baselineFingerprint": "sha256:…"   // 必填：/api/sandbox/preview 返回的 baseline.fingerprint
+}
+```
+
+（`adds / updates / deletes` 也可与 `baselineFingerprint` 一起直接放在 body 顶层；三类操作均可选但合计至少一条。）
+
+成功返回：
+
+```jsonc
+{
+  "format": "shortcut-sandbox-publish-v1",
+  "publishedAt": "…",
+  "counts": { "adds": 1, "updates": 1, "deletes": 1 },
+  "addedCommands": [ { "draftId": "draft-x1", "commandId": "cmd-<uuid>", "name": "新命令", "contextId": "ctx-terminal" } ],
+  "updatedCommandIds": ["cmd-16"],
+  "deletedCommandIds": ["cmd-10"],
+  "baseline": { "fingerprint": "sha256:…", "contextCount": 4, "commandCount": 19 }
+}
+```
+
+失败（均不产生任何写入，草案保留在浏览器）：
+
+- `409 BASELINE_CHANGED`：预演后基线数据已变化——
+  ```jsonc
+  { "error": "基线数据已变化，请基于最新数据重新预演后再发布", "code": "BASELINE_CHANGED",
+    "details": {
+      "current": { "fingerprint": "sha256:…", "contextCount": 4, "commandCount": 18 },
+      "invalidated": { "stale": true,
+        "adds":    [ { "draftId": "draft-x1", "contextId": "ctx-gone" } ],
+        "updates": [ { "commandId": "cmd-9" } ],
+        "deletes": [ { "commandId": "cmd-8" } ] } } }
+  ```
+- `409 DRAFT_CONFLICTS`：临界区内复跑预演发现**新增** duplicate/prefix 冲突——
+  `details.newConflicts[]` 逐项给出 `type / goalId / contextId / contextPath /
+  sequenceLabel（prefix 为 prefixSequenceLabel + extensionSequenceLabel）/ commandIds`；
+- `400`：缺少指纹、草案为空，或草案非法（与 preview 同一套校验）。
 
 `POST /api/conflicts/resolve/:contextId` 请求体（全部字段可选）：
 
@@ -365,11 +436,13 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
 ├── docker-compose.yml        # 一条命令启动，端口 3000，命名卷持久化
 ├── server/
 │   ├── src/
-│   │   ├── index.js          # Express 入口、API（含沙盒预演、冲突消解）、静态托管
-│   │   ├── engine.js         # 核心规则：最近祖先/冲突/逐键模拟/回归套件（精确集合覆盖）/沙盒预演/冲突消解（分支限界改键搜索）
-│   │   ├── store.js          # JSON 文件持久化 + 校验
+│   │   ├── index.js          # Express 入口、API（含沙盒预演/发布、冲突消解）、静态托管
+│   │   ├── engine.js         # 核心规则：最近祖先/冲突/逐键模拟/回归套件（精确集合覆盖）/沙盒预演（版本指纹）/冲突消解（分支限界改键搜索）
+│   │   ├── store.js          # JSON 文件持久化 + 校验 + 写临界区（草案发布：核对指纹→校验→原子落盘）
 │   │   └── seed.js           # 初始演示数据
-│   └── test/engine.test.js   # 引擎单测
+│   └── test/
+│       ├── engine.test.js    # 引擎单测
+│       └── publish.test.js   # 发布接口测试（真实 HTTP + 临时数据目录）
 └── client/
     ├── src/
     │   ├── App.jsx

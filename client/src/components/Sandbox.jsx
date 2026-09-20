@@ -5,8 +5,12 @@ import { api } from '../api';
  * 变更沙盒：
  * - 基于当前状态批量暂存命令的新增 / 改序列 / 删除，草案只保存在浏览器
  *   localStorage，既不写入数据文件，也不影响审校页；
- * - 预演由后端在同一份草案上分别计算基线与模拟状态后给出差异，
- *   本页展示每项差异的来源路径与最短触发输入，支持清空草案与下载预演 JSON。
+ * - 预演由后端在同一份草案上分别计算基线与模拟状态后给出差异（含基线版本指纹），
+ *   本页展示每项差异的来源路径与最短触发输入，支持清空草案与下载预演 JSON；
+ * - 草案已成功预演且不引入任何新增 duplicate / prefix 冲突时可一键发布：
+ *   后端在单次临界区内重新核对指纹、复用草案校验并原子落盘；
+ *   发布成功后清空本地草案并刷新审校状态，失败（基线变化/仍有冲突）保留草案
+ *   供调整后重新预演，绝不部分落盘。
  */
 
 export const DRAFT_KEY = 'shortcut-sandbox-draft-v1';
@@ -132,6 +136,9 @@ export default function Sandbox({ state, onRefresh }) {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [running, setRunning] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [publishError, setPublishError] = useState(null);
+  const [published, setPublished] = useState(null);
   const [ctxId, setCtxId] = useState('');
   const [addForm, setAddForm] = useState({ name: '', sequence: '', description: '' });
 
@@ -195,14 +202,28 @@ export default function Sandbox({ state, onRefresh }) {
 
   const isEmpty = draftSize(draft) === 0;
 
+  // 当前展示的预演是否与当前草案一致（草案一改即过期，发布按钮禁用）
+  const previewSignature = preview?._draftSignature || '';
+  const currentSignature = JSON.stringify(draft);
+  const previewFresh = !isEmpty && !!preview && previewSignature === currentSignature;
+  const newConflictCount = preview
+    ? preview.stats.duplicateAppeared + preview.stats.prefixAppeared
+    : 0;
+  const canPublish = previewFresh && newConflictCount === 0 && !publishing;
+
   const runPreview = useCallback(async (d) => {
     setRunning(true);
+    setPublishError(null);
     try {
-      setPreview(await api.sandboxPreview(d));
+      const result = await api.sandboxPreview(d);
+      result._draftSignature = JSON.stringify(d);
+      setPreview(result);
       setError('');
+      return result;
     } catch (err) {
       setPreview(null);
       setError(err.message);
+      return null;
     } finally {
       setRunning(false);
     }
@@ -215,6 +236,7 @@ export default function Sandbox({ state, onRefresh }) {
       setError('');
       return;
     }
+    setPublishError(null);
     const timer = setTimeout(() => runPreview(draft), 250);
     return () => clearTimeout(timer);
   }, [draft, isEmpty, runPreview]);
@@ -280,12 +302,61 @@ export default function Sandbox({ state, onRefresh }) {
     if (!window.confirm('确定清空全部草案操作？仅清除浏览器中的草案，不会影响服务器数据。')) return;
     setDraft(emptyDraft());
     setPreview(null);
+    setPublishError(null);
+    setPublished(null);
     setNotice('草案已清空。');
+  };
+
+  /**
+   * 发布当前草案：必须先有与草案一致的成功预演且无新增冲突。
+   * 成功 => 清空本地草案、刷新审校状态、展示新增/改序列/删除数量；
+   * 失败 => 保留草案供重新预演：
+   *   BASELINE_CHANGED：拉取最新状态并以最新数据重新预演（失效操作由现有逻辑剔除）；
+   *   DRAFT_CONFLICTS：展示新增冲突，要求调整草案后重新预演。
+   */
+  const publish = async () => {
+    if (!previewFresh) return;
+    setPublishing(true);
+    setPublishError(null);
+    try {
+      const result = await api.sandboxPublish(draft, preview.baseline.fingerprint);
+      setPublished(result);
+      setDraft(emptyDraft());
+      setPreview(null);
+      setError('');
+      try {
+        window.localStorage.removeItem(DRAFT_KEY);
+      } catch {
+        /* 忽略本地存储异常 */
+      }
+      await onRefresh?.();
+    } catch (err) {
+      let info;
+      try {
+        info = err.info || null;
+      } catch {
+        info = null;
+      }
+      setPublishError({ message: err.message, ...(info || {}) });
+      // 基线已变化：刷新最新数据后重新预演当前草案（仍保留在本地）
+      if (err.code === 'BASELINE_CHANGED') {
+        try {
+          await onRefresh?.();
+          const d = loadDraft();
+          if (draftSize(d) > 0) await runPreview(d);
+        } catch {
+          /* 刷新失败时仅展示错误，草案保留 */
+        }
+      }
+    } finally {
+      setPublishing(false);
+    }
   };
 
   const downloadJson = () => {
     if (!preview) return;
-    const blob = new Blob([JSON.stringify(preview, null, 2)], { type: 'application/json' });
+    const { _draftSignature, ...cleanPreview } = preview;
+    const blob = new Blob([JSON.stringify(cleanPreview, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -314,6 +385,22 @@ export default function Sandbox({ state, onRefresh }) {
           <button onClick={() => runPreview(draft)} disabled={isEmpty || running}>
             {running ? '预演中…' : '重新预演'}
           </button>
+          <button
+            className="primary"
+            onClick={publish}
+            disabled={!canPublish}
+            title={
+              isEmpty
+                ? '草案为空'
+                : !previewFresh
+                  ? '草案已修改，请先重新预演'
+                  : newConflictCount > 0
+                    ? '预演显示仍有新增的同层重复 / 前缀冲突'
+                    : '把当前草案原子写入真实数据'
+            }
+          >
+            {publishing ? '发布中…' : '✅ 发布草案'}
+          </button>
           <button className="primary" onClick={downloadJson} disabled={!preview}>
             下载预演 JSON
           </button>
@@ -330,6 +417,91 @@ export default function Sandbox({ state, onRefresh }) {
         </p>
       )}
       {error && <p className="error">⚠ {error}</p>}
+
+      {published && (
+        <div className="publish-success panel">
+          <div className="publish-success-head">
+            <strong>✅ 草案已发布并原子写入数据</strong>
+            <button onClick={() => setPublished(null)}>知道了</button>
+          </div>
+          <div className="stat-grid">
+            <StatCard value={published.counts.adds} label="新增命令" tone="ok" />
+            <StatCard value={published.counts.updates} label="改序列命令" tone="ok" />
+            <StatCard value={published.counts.deletes} label="删除命令" tone="danger" />
+          </div>
+          <p className="dim small">
+            发布时间：{new Date(published.publishedAt).toLocaleString()} · 本地草案已清空，审校状态已按
+            新版本刷新。
+          </p>
+        </div>
+      )}
+
+      {publishError && (
+        <div className="publish-error panel">
+          <div className="publish-error-head">
+            <strong>⚠ 发布被拒绝（草案已保留，未写入任何数据）</strong>
+            <button onClick={() => setPublishError(null)}>知道了</button>
+          </div>
+          <p>{publishError.message}</p>
+          {publishError.code === 'BASELINE_CHANGED' && (
+            <div>
+              <p className="dim small">
+                服务器当前版本：<code>{publishError.current?.fingerprint?.slice(0, 18)}…</code> ·
+                上下文 {publishError.current?.contextCount} · 命令 {publishError.current?.commandCount}
+                ；已按最新数据重新预演，请确认后再次发布。
+              </p>
+              {publishError.invalidated?.stale && (
+                <div className="invalidated-ops">
+                  <h4>已失效的草案操作（数据已变化）</h4>
+                  <ul className="diff-list">
+                    {(publishError.invalidated.adds || []).map((a, i) => (
+                      <li key={`ia-${i}`} className="diff-item disappeared">
+                        <span className="diff-sign">−</span>
+                        <span className="role-tag draft-add">新增</span>
+                        <span className="dim small">目标上下文已不存在：{a.contextId || '（空）'}</span>
+                      </li>
+                    ))}
+                    {(publishError.invalidated.updates || []).map((u) => (
+                      <li key={`iu-${u.commandId}`} className="diff-item disappeared">
+                        <span className="diff-sign">−</span>
+                        <span className="role-tag draft-update">改序列</span>
+                        <span className="dim small">命令已不存在：{u.commandId}</span>
+                      </li>
+                    ))}
+                    {(publishError.invalidated.deletes || []).map((d2) => (
+                      <li key={`id-${d2.commandId}`} className="diff-item disappeared">
+                        <span className="diff-sign">−</span>
+                        <span className="role-tag draft-delete">删除</span>
+                        <span className="dim small">命令已不存在：{d2.commandId}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+          {publishError.code === 'DRAFT_CONFLICTS' && (
+            <div className="invalidated-ops">
+              <h4>预演新增的冲突（{publishError.newConflicts?.length || 0} 项）</h4>
+              <ul className="diff-list">
+                {(publishError.newConflicts || []).map((c, i) => (
+                  <li key={`nc-${i}`} className="diff-item appeared">
+                    <span className="diff-sign">＋</span>
+                    <span className={`badge ${c.type === 'duplicate' ? 'duplicate' : 'prefix'}`}>
+                      {c.type === 'duplicate' ? '同层重复' : '前缀冲突'}
+                    </span>
+                    <span className="party-source">
+                      {c.contextPath}：{c.sequenceLabel || `${c.prefixSequenceLabel} ⊂ ${c.extensionSequenceLabel}`}
+                    </span>
+                    <span className="dim small">{(c.commandIds || []).join(', ')}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="dim small">请在草案中调整相关操作后重新预演，无新增冲突时才能发布。</p>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="panel">
         <div className="panel-header">
@@ -489,7 +661,59 @@ export default function Sandbox({ state, onRefresh }) {
       <div className="panel">
         <div className="panel-header">
           <h2>
-            ③ 预演结果 <span className="sub">基线 vs 应用草案后的模拟状态</span>
+            ③ 发布草案 <span className="sub">仅可发布已成功预演、且无新增 duplicate / prefix 冲突的草案</span>
+          </h2>
+        </div>
+        {isEmpty ? (
+          <p className="hint">草案为空：暂存操作并完成预演后，可在此原子发布到真实数据。</p>
+        ) : (
+          <div className="publish-box">
+            <ul className="publish-checks">
+              <li className={preview ? 'ok' : running ? 'pending' : 'bad'}>
+                {preview ? '✅' : running ? '⏳' : '⚠'} 已成功预演
+                {preview && (
+                  <span className="dim small">
+                    （{new Date(preview.generatedAt).toLocaleTimeString()}）
+                  </span>
+                )}
+                {!preview && !running && <span className="dim small">请等待或手动重新预演</span>}
+              </li>
+              <li className={previewFresh ? 'ok' : 'bad'}>
+                {previewFresh ? '✅' : '⚠'} 预演与当前草案一致
+                {!previewFresh && <span className="dim small">（草案已修改，正在/需要重新预演）</span>}
+              </li>
+              <li className={newConflictCount === 0 ? 'ok' : 'bad'}>
+                {newConflictCount === 0 ? '✅' : '⚠'} 无新增同层重复 / 前缀冲突
+                {newConflictCount > 0 && (
+                  <span className="dim small">
+                    （新增 duplicate {preview.stats.duplicateAppeared} · prefix{' '}
+                    {preview.stats.prefixAppeared}）
+                  </span>
+                )}
+              </li>
+            </ul>
+            <p className="dim small">
+              发布在服务端单次临界区内完成：重新核对基线指纹（
+              <code>{preview ? `${preview.baseline.fingerprint.slice(0, 18)}…` : '—'}</code>
+              ）→ 复用草案校验 → 原子落盘。数据在别处已变化时会拒绝发布并返回当前版本与失效操作，
+              不会部分落盘；失败时草案保留，可调整后重新预演。
+            </p>
+            <div className="publish-actions">
+              <button className="primary" onClick={publish} disabled={!canPublish}>
+                {publishing ? '发布中…' : '✅ 发布草案'}
+              </button>
+              {!isEmpty && newConflictCount > 0 && (
+                <span className="error-inline">存在新增冲突，无法发布，请调整草案</span>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">
+          <h2>
+            ④ 预演结果 <span className="sub">基线 vs 应用草案后的模拟状态</span>
           </h2>
           <button className="primary" onClick={downloadJson} disabled={!preview}>
             下载预演 JSON
@@ -529,6 +753,18 @@ export default function Sandbox({ state, onRefresh }) {
 
             {preview.stats.totalChanges === 0 && (
               <p className="hint">✅ 草案与基线完全一致：没有产生任何差异。</p>
+            )}
+
+            {newConflictCount > 0 && (
+              <p className="error">
+                ⛔ 本草案新增 {preview.stats.duplicateAppeared} 项同层重复、
+                {preview.stats.prefixAppeared} 项前缀冲突——存在新增冲突时不可发布，请调整草案。
+              </p>
+            )}
+            {previewFresh && newConflictCount === 0 && (
+              <p className="hint ok-hint">
+                ✅ 预演成功且无新增 duplicate / prefix 冲突，可以发布。
+              </p>
             )}
 
             {preview.unreachable.appeared.length + preview.unreachable.disappeared.length > 0 && (

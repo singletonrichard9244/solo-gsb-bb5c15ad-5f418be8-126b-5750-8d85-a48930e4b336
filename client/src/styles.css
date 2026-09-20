@@ -1308,3 +1308,69 @@ select:focus {
   padding: 2px 7px;
   white-space: nowrap;
 }
+
+/* ---- 沙盒草案发布 ---- */
+.publish-box {
+  padding: 12px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.publish-checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+.publish-checks li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.publish-checks li.ok {
+  color: var(--ok);
+}
+.publish-checks li.bad {
+  color: var(--danger);
+}
+.publish-checks li.pending {
+  color: var(--warn);
+}
+.publish-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.error-inline {
+  color: var(--danger);
+  font-size: 12.5px;
+}
+.ok-hint {
+  color: var(--ok);
+}
+.publish-success {
+  border-color: rgba(62, 207, 142, 0.5);
+  background: rgba(62, 207, 142, 0.06);
+}
+.publish-success-head,
+.publish-error-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.publish-error {
+  border-color: rgba(240, 107, 122, 0.55);
+  background: rgba(240, 107, 122, 0.07);
+}
+.publish-error h4 {
+  margin: 10px 0 6px;
+}
+.invalidated-ops {
+  margin-top: 8px;
+}

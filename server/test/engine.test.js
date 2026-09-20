@@ -9,6 +9,8 @@ const {
   previewSandbox,
   replayTimeline,
   resolveConflicts,
+  stateFingerprint,
+  inspectStaleDraftOps,
 } = require('../src/engine');
 
 let passed = 0;
@@ -587,6 +589,81 @@ test('沙盒预演：纯内存计算，不修改基线状态', () => {
     deletes: ['m2'],
   });
   assert.equal(JSON.stringify(sandboxState), before);
+});
+
+// ---------- 基线版本指纹与失效操作核对（草案发布） ----------
+test('版本指纹：实质内容相同（顺序不同）指纹相同，内容变化指纹变化', () => {
+  const reordered = {
+    contexts: [...sandboxState.contexts].reverse(),
+    commands: [...sandboxState.commands].reverse(),
+  };
+  assert.equal(stateFingerprint(sandboxState), stateFingerprint(reordered));
+  assert.match(stateFingerprint(sandboxState), /^sha256:[0-9a-f]{64}$/);
+
+  const changed = {
+    contexts: sandboxState.contexts,
+    commands: sandboxState.commands.map((c) =>
+      c.id === 'm3' ? { ...c, sequenceTokens: ['u'], sequenceLabel: 'U' } : c,
+    ),
+  };
+  assert.notEqual(stateFingerprint(sandboxState), stateFingerprint(changed));
+
+  // 仅描述变化也视为版本变化
+  const descChanged = {
+    contexts: sandboxState.contexts.map((c) => (c.id === 'a' ? { ...c, description: 'x' } : c)),
+    commands: sandboxState.commands,
+  };
+  assert.notEqual(stateFingerprint(sandboxState), stateFingerprint(descChanged));
+});
+
+test('版本指纹：预演响应携带基线指纹与基线规模', () => {
+  const res = previewSandbox(sandboxState, { deletes: ['m2'] });
+  assert.equal(res.baseline.fingerprint, stateFingerprint(sandboxState));
+  assert.equal(res.baseline.contextCount, 3);
+  assert.equal(res.baseline.commandCount, 3);
+  // 草案不同不影响基线指纹（基线是当前真实状态）
+  const res2 = previewSandbox(sandboxState, { updates: [{ commandId: 'm3', sequence: 'u' }] });
+  assert.equal(res2.baseline.fingerprint, res.baseline.fingerprint);
+});
+
+test('失效操作核对：目标上下文/命令消失时逐条标出，adds 只看目标上下文', () => {
+  // 基线仍为 sandboxState => 无失效
+  assert.equal(inspectStaleDraftOps(sandboxState, {
+    adds: [{ draftId: 'd1', contextId: 'a', name: 'n', sequence: 'n' }],
+    updates: [{ commandId: 'm3', sequence: 'u' }],
+    deletes: ['m2'],
+  }).stale, false);
+
+  // 上下文 b 被删除：adds 的目标上下文失效；更新/删除的命令消失也失效
+  const withoutB = {
+    contexts: sandboxState.contexts.filter((c) => c.id !== 'b'),
+    commands: sandboxState.commands.filter((c) => c.id !== 'm3' && c.id !== 'm2'),
+  };
+  const stale = inspectStaleDraftOps(withoutB, {
+    adds: [
+      { draftId: 'd1', contextId: 'b', name: 'n1', sequence: 'n' },
+      { draftId: 'd2', contextId: 'a', name: 'n2', sequence: 'n' },
+    ],
+    updates: [{ commandId: 'm3', sequence: 'u' }],
+    deletes: ['m2', 'm1'], // m2 已删除（失效），m1 仍在（有效）
+  });
+  assert.equal(stale.stale, true);
+  assert.deepEqual(stale.adds, [{ draftId: 'd1', contextId: 'b' }]);
+  assert.deepEqual(stale.updates, [{ commandId: 'm3' }]);
+  assert.deepEqual(stale.deletes, [{ commandId: 'm2' }]);
+});
+
+test('发布可行性：预演新增 duplicate/prefix 冲突可由 stats 与差异检出', () => {
+  // m3: J → S 与 m2 同层重复 => duplicateAppeared > 0，不可发布
+  const dup = previewSandbox(sandboxState, { updates: [{ commandId: 'm3', sequence: 's' }] });
+  assert.ok(dup.stats.duplicateAppeared > 0);
+  // 无冲突草案：m3 改到未占用的 u，删除 m2（恢复 m1），不引入任何新冲突
+  const clean = previewSandbox(sandboxState, {
+    updates: [{ commandId: 'm3', sequence: 'u' }],
+    deletes: ['m2'],
+  });
+  assert.equal(clean.stats.duplicateAppeared, 0);
+  assert.equal(clean.stats.prefixAppeared, 0);
 });
 
 // ---------- 冲突消解（改键方案搜索） ----------

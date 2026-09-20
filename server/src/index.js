@@ -133,6 +133,7 @@ app.get('/api/regression-suite', (req, res, next) => {
 // ---- 变更沙盒预演（只读：在内存副本上应用草案并对比基线，绝不写回数据文件） ----
 // POST body 即草案：{ adds: [{draftId?, contextId, name, sequence, description?}],
 //                     updates: [{commandId, sequence}], deletes: [commandId, ...] }
+// 响应 baseline.fingerprint 为基线版本指纹，发布 /api/sandbox/publish 时须原样回传。
 app.post(
   '/api/sandbox/preview',
   wrap((req, res) => {
@@ -141,6 +142,31 @@ app.post(
       res.setHeader('Content-Disposition', 'attachment; filename="sandbox-preview.json"');
     }
     res.json(result);
+  }),
+);
+
+// ---- 变更沙盒发布（写临界区：核对基线指纹 → 复用草案校验 → 原子落盘） ----
+// POST body: { draft: {adds, updates, deletes}, baselineFingerprint }
+// 也接受把草案字段直接放在 body 顶层（与 preview 一致）：
+//   { adds, updates, deletes, baselineFingerprint }
+// 基线已变化 => 409 code=BASELINE_CHANGED（返回当前版本与失效操作，不落盘）；
+// 草案引入新 duplicate/prefix => 409 code=DRAFT_CONFLICTS（不落盘）。
+app.post(
+  '/api/sandbox/publish',
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const draft =
+      body.draft && typeof body.draft === 'object'
+        ? body.draft
+        : { adds: body.adds, updates: body.updates, deletes: body.deletes };
+    // 与 preview 一致：三类操作均可选，缺省按空数组处理
+    const normalizedDraft = {
+      adds: Array.isArray(draft.adds) ? draft.adds : [],
+      updates: Array.isArray(draft.updates) ? draft.updates : [],
+      deletes: Array.isArray(draft.deletes) ? draft.deletes : [],
+    };
+    const result = await store.publishDraft(normalizedDraft, body.baselineFingerprint);
+    res.status(200).json(result);
   }),
 );
 
@@ -162,7 +188,10 @@ app.post(
 
 // ---- 错误处理 ----
 app.use('/api', (err, req, res, next) => {
-  res.status(err.status || 500).json({ error: err.message || '服务器内部错误' });
+  const payload = { error: err.message || '服务器内部错误' };
+  if (err.code) payload.code = err.code;
+  if (err.details) payload.details = err.details;
+  res.status(err.status || 500).json(payload);
 });
 
 // ---- 生产环境托管前端构建产物 ----
@@ -177,9 +206,14 @@ if (fs.existsSync(clientDist)) {
 
 const PORT = Number(process.env.PORT) || 3000;
 
-store.init().then((mode) => {
-  app.listen(PORT, () => {
-    console.log(`[shortcut-console] 数据初始化：${mode}`);
-    console.log(`[shortcut-console] 服务已启动: http://localhost:${PORT}`);
+// 仅在作为入口直接运行时监听端口，便于测试以 store.init() 后注入 supertest/原生 fetch
+if (require.main === module) {
+  store.init().then((mode) => {
+    app.listen(PORT, () => {
+      console.log(`[shortcut-console] 数据初始化：${mode}`);
+      console.log(`[shortcut-console] 服务已启动: http://localhost:${PORT}`);
+    });
   });
-});
+}
+
+module.exports = { app };

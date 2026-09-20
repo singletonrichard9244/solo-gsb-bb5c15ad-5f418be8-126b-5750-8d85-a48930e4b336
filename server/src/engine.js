@@ -6,6 +6,8 @@
  * - 被更深层同序列覆盖的祖先绑定标记为 shadowed（不生效）
  */
 
+const crypto = require('node:crypto');
+
 const MAX_PRESSES = 3;
 
 const MODIFIERS = new Set(['ctrl', 'alt', 'shift', 'meta']);
@@ -1026,6 +1028,57 @@ function pressToPretty(token) {
 /* ================= 变更沙盒预演 ================= */
 
 /**
+ * 基线版本指纹：对状态的「实质内容」（上下文树与命令序列）做稳定序列化后
+ * 取 SHA-256。序列化为「按 id 排序后按固定字段顺序」的结构，因此与数据文件
+ * 中的条目顺序无关；仅名称/描述/父子关系/序列等实质字段变化才会使指纹改变。
+ * 预演返回该指纹，发布时在临界区内重新核对，防止基于过期基线落盘。
+ */
+function stateFingerprint(state) {
+  const contexts = (state?.contexts || [])
+    .map((c) => ({ id: c.id, parentId: c.parentId || null, name: c.name, description: c.description || '' }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const commands = (state?.commands || [])
+    .map((c) => ({
+      id: c.id,
+      contextId: c.contextId,
+      name: c.name,
+      description: c.description || '',
+      sequenceTokens: Array.isArray(c.sequenceTokens) ? [...c.sequenceTokens] : [],
+    }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const canonical = JSON.stringify({ v: 'shortcut-state-v1', contexts, commands });
+  return `sha256:${crypto.createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * 检查草案中因基线变化而失效的操作（目标上下文 / 命令已不存在）。
+ * 纯读取、不抛错；供发布时基线已变化的 409 响应告知客户端可剔除项。
+ * 注意：adds 的 draftId 不在服务端状态中（发布时才分配真实 id），
+ * 只有其目标上下文消失才算失效；重复 draftId 等仍由 applyDraft 校验。
+ */
+function inspectStaleDraftOps(state, draft) {
+  const d = draft || {};
+  const cmdIds = new Set((state.commands || []).map((c) => c.id));
+  const ctxIds = new Set((state.contexts || []).map((c) => c.id));
+  const staleAdds = (Array.isArray(d.adds) ? d.adds : []).filter(
+    (a) => !a || !a.contextId || !ctxIds.has(a.contextId),
+  );
+  const staleUpdates = (Array.isArray(d.updates) ? d.updates : []).filter(
+    (u) => !u || !u.commandId || !cmdIds.has(u.commandId),
+  );
+  const staleDeletes = (Array.isArray(d.deletes) ? d.deletes : []).filter((raw) => {
+    const id = typeof raw === 'string' ? raw : raw && raw.commandId;
+    return !id || !cmdIds.has(id);
+  });
+  return {
+    stale: staleAdds.length + staleUpdates.length + staleDeletes.length > 0,
+    adds: staleAdds.map((a) => ({ draftId: a?.draftId || null, contextId: a?.contextId || null })),
+    updates: staleUpdates.map((u) => ({ commandId: u.commandId })),
+    deletes: staleDeletes.map((raw) => ({ commandId: typeof raw === 'string' ? raw : raw.commandId })),
+  };
+}
+
+/**
  * 把草案（新增 / 改序列 / 删除）应用到状态副本上，返回模拟状态。
  * 纯内存计算：不触碰持久化数据，也不修改传入的 baseState；
  * 所有校验失败均抛出 400，保证非法草案不会产生任何副作用。
@@ -1283,7 +1336,13 @@ function previewSandbox(baseState, draft) {
     stats.unreachableDisappeared;
 
   return {
+    format: 'shortcut-sandbox-preview-v1',
     generatedAt: new Date().toISOString(),
+    baseline: {
+      fingerprint: stateFingerprint(baseState),
+      contextCount: baseState.contexts.length,
+      commandCount: baseState.commands.length,
+    },
     draft: summary,
     stats,
     contexts: contextDiffs,
@@ -1850,5 +1909,7 @@ module.exports = {
   generateRegressionSuite,
   applyDraft,
   previewSandbox,
+  stateFingerprint,
+  inspectStaleDraftOps,
   resolveConflicts,
 };
