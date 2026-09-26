@@ -2,13 +2,30 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { parseSequence, buildIndex } = require('./engine');
+const {
+  parseSequence,
+  buildIndex,
+  stateFingerprint,
+  inspectDraftOps,
+  prepareSandboxCommit,
+} = require('./engine');
 const seed = require('./seed');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'state.json');
 
 let state = { contexts: [], commands: [] };
+
+/**
+ * 写操作临界区：所有会修改内存状态并落盘的操作都经由此队列串行执行，
+ * 保证「核对指纹 → 校验草案 → 原子写入」之间不会被其它写操作插入。
+ */
+let writeQueue = Promise.resolve();
+function withWriteLock(fn) {
+  const run = writeQueue.then(fn);
+  writeQueue = run.catch(() => {});
+  return run;
+}
 
 async function init() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
@@ -30,6 +47,20 @@ async function init() {
   return 'seeded';
 }
 
+/** 把给定状态原子写入数据文件（tmp + rename），并替换内存状态 */
+function persistState(nextState) {
+  return new Promise((resolve, reject) => {
+    fs.writeFile(DATA_FILE + '.tmp', JSON.stringify(nextState, null, 2), (err) => {
+      if (err) return reject(err);
+      fs.rename(DATA_FILE + '.tmp', DATA_FILE, (err2) => {
+        if (err2) return reject(err2);
+        state = nextState;
+        resolve();
+      });
+    });
+  });
+}
+
 function persist() {
   // 简单串行化写入，避免并发覆盖
   return new Promise((resolve, reject) => {
@@ -45,6 +76,11 @@ function snapshot() {
     contexts: state.contexts.map((c) => ({ ...c })),
     commands: state.commands.map((c) => ({ ...c })),
   };
+}
+
+/** 当前数据版本的指纹（与预演响应中的 baselineFingerprint 同一口径） */
+function fingerprint() {
+  return stateFingerprint(state);
 }
 
 function getContext(id) {
@@ -71,7 +107,7 @@ function descendantIds(contextId) {
   return out;
 }
 
-async function createContext({ name, parentId = null, description = '' }) {
+async function createContextLocked({ name, parentId = null, description = '' }) {
   if (!name || !String(name).trim()) {
     throw Object.assign(new Error('上下文名称不能为空'), { status: 400 });
   }
@@ -87,7 +123,7 @@ async function createContext({ name, parentId = null, description = '' }) {
   return ctx;
 }
 
-async function updateContext(id, patch) {
+async function updateContextLocked(id, patch) {
   const ctx = assertContextExists(id);
   if (patch.name !== undefined) {
     if (!String(patch.name).trim()) throw Object.assign(new Error('上下文名称不能为空'), { status: 400 });
@@ -109,7 +145,7 @@ async function updateContext(id, patch) {
   return ctx;
 }
 
-async function deleteContext(id) {
+async function deleteContextLocked(id) {
   assertContextExists(id);
   const ids = new Set(descendantIds(id));
   state.contexts = state.contexts.filter((c) => !ids.has(c.id));
@@ -118,7 +154,7 @@ async function deleteContext(id) {
   return { deletedContexts: ids.size };
 }
 
-async function createCommand({ contextId, name, sequence, description = '' }) {
+async function createCommandLocked({ contextId, name, sequence, description = '' }) {
   assertContextExists(contextId);
   if (!name || !String(name).trim()) {
     throw Object.assign(new Error('命令名称不能为空'), { status: 400 });
@@ -139,7 +175,7 @@ async function createCommand({ contextId, name, sequence, description = '' }) {
   return cmd;
 }
 
-async function updateCommand(id, patch) {
+async function updateCommandLocked(id, patch) {
   const cmd = state.commands.find((c) => c.id === id);
   if (!cmd) throw Object.assign(new Error('命令不存在'), { status: 404 });
   if (patch.name !== undefined) {
@@ -162,7 +198,7 @@ async function updateCommand(id, patch) {
   return cmd;
 }
 
-async function deleteCommand(id) {
+async function deleteCommandLocked(id) {
   const before = state.commands.length;
   state.commands = state.commands.filter((c) => c.id !== id);
   if (state.commands.length === before) throw Object.assign(new Error('命令不存在'), { status: 404 });
@@ -170,14 +206,80 @@ async function deleteCommand(id) {
   return { ok: true };
 }
 
+// ---- 对外写接口：统一进入写临界区，串行执行 ----
+const createContext = (body) => withWriteLock(() => createContextLocked(body));
+const updateContext = (id, patch) => withWriteLock(() => updateContextLocked(id, patch));
+const deleteContext = (id) => withWriteLock(() => deleteContextLocked(id));
+const createCommand = (body) => withWriteLock(() => createCommandLocked(body));
+const updateCommand = (id, patch) => withWriteLock(() => updateCommandLocked(id, patch));
+const deleteCommand = (id) => withWriteLock(() => deleteCommandLocked(id));
+
+/**
+ * 发布沙盒草案（在单次写临界区内完成全部核对与落盘）：
+ * 1. 重新核对基线指纹：数据已被其它操作修改时抛 409（code: sandbox-stale），
+ *    携带当前指纹与失效操作清单，不写入任何数据；
+ * 2. 复用与预演完全一致的草案校验（非法草案抛 400）；
+ * 3. 拒绝引入新增 duplicate / prefix 冲突的草案（抛 409，code: sandbox-conflicts）；
+ * 4. 全部通过后一次性原子写入（tmp + rename），绝不部分落盘。
+ *
+ * 返回 { fingerprint, counts, addedCommands, updatedCommandIds, deletedCommandIds }。
+ */
+async function commitSandboxDraft(draft, expectedFingerprint) {
+  return withWriteLock(async () => {
+    const currentFingerprint = stateFingerprint(state);
+    if (expectedFingerprint !== currentFingerprint) {
+      const inspection = inspectDraftOps(state, draft);
+      throw Object.assign(new Error('数据已变化：预演基线已过期，请重新预演后再发布'), {
+        status: 409,
+        code: 'sandbox-stale',
+        details: {
+          currentFingerprint,
+          invalidCount: inspection.invalidCount,
+          invalid: inspection.invalid,
+        },
+      });
+    }
+
+    // 指纹一致：复用草案校验与冲突门禁（非法抛 400，引入新冲突抛 409）
+    const { simState, summary } = prepareSandboxCommit(state, draft);
+
+    // 新增命令在预演中使用草案临时 id；落盘前换成正式 id
+    const addedCommands = [];
+    const finalCommands = simState.commands.map((cmd) => {
+      if (!summary.addedCommandIds.includes(cmd.id)) return cmd;
+      const published = { ...cmd, id: `cmd-${randomUUID()}` };
+      addedCommands.push({
+        draftId: cmd.id,
+        commandId: published.id,
+        name: published.name,
+        contextId: published.contextId,
+        sequenceLabel: published.sequenceLabel,
+      });
+      return published;
+    });
+
+    await persistState({ contexts: simState.contexts, commands: finalCommands });
+
+    return {
+      fingerprint: stateFingerprint(state),
+      counts: { adds: summary.adds, updates: summary.updates, deletes: summary.deletes },
+      addedCommands: addedCommands.sort((a, b) => (a.draftId < b.draftId ? -1 : a.draftId > b.draftId ? 1 : 0)),
+      updatedCommandIds: summary.updatedCommandIds,
+      deletedCommandIds: summary.deletedCommandIds,
+    };
+  });
+}
+
 module.exports = {
   init,
   snapshot,
+  fingerprint,
   createContext,
   updateContext,
   deleteContext,
   createCommand,
   updateCommand,
   deleteCommand,
+  commitSandboxDraft,
   descendantIds,
 };

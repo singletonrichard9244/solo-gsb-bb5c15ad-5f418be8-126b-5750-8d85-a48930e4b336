@@ -11,7 +11,9 @@
     "dev": "concurrently -k -n server,web -c cyan,magenta \"npm run dev -w server\" \"npm run dev -w client\"",
     "build": "npm run build -w client",
     "start": "node server/src/index.js",
-    "test:engine": "node server/test/engine.test.js"
+    "test:engine": "node server/test/engine.test.js",
+    "test:api": "node server/test/publish.api.test.js",
+    "test": "npm run test:engine && npm run test:api"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

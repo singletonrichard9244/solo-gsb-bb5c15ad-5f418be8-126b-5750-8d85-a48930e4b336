@@ -9,6 +9,9 @@ const {
   previewSandbox,
   replayTimeline,
   resolveConflicts,
+  stateFingerprint,
+  inspectDraftOps,
+  prepareSandboxCommit,
 } = require('../src/engine');
 
 let passed = 0;
@@ -587,6 +590,124 @@ test('沙盒预演：纯内存计算，不修改基线状态', () => {
     deletes: ['m2'],
   });
   assert.equal(JSON.stringify(sandboxState), before);
+});
+
+// ---------- 沙盒发布（指纹 / 冲突门禁 / 失效操作） ----------
+test('基线指纹：仅依赖状态内容，与数组顺序无关', () => {
+  const f1 = stateFingerprint(sandboxState);
+  const f2 = stateFingerprint({
+    contexts: [...sandboxState.contexts].reverse(),
+    commands: [...sandboxState.commands].reverse(),
+  });
+  assert.equal(f1, f2);
+  assert.match(f1, /^[0-9a-f]{64}$/);
+  // 数据变化后指纹不同
+  const changed = {
+    contexts: sandboxState.contexts,
+    commands: sandboxState.commands.map((c) => (c.id === 'm3' ? { ...c, sequenceTokens: ['q'], sequenceLabel: 'Q' } : c)),
+  };
+  assert.notEqual(stateFingerprint(changed), f1);
+});
+
+test('预演响应携带基线指纹，与 stateFingerprint 一致', () => {
+  const res = previewSandbox(sandboxState, { deletes: ['m2'] });
+  assert.equal(res.baselineFingerprint, stateFingerprint(sandboxState));
+});
+
+test('发布核算：合法且无新增冲突的草案通过，返回模拟状态与摘要', () => {
+  const draft = { deletes: ['m2'] }; // 覆盖解除：不引入任何新冲突
+  const { simState, summary } = prepareSandboxCommit(sandboxState, draft);
+  assert.equal(summary.deletes, 1);
+  assert.equal(simState.commands.length, sandboxState.commands.length - 1);
+  assert.ok(!simState.commands.some((c) => c.id === 'm2'));
+  // 基线不被修改
+  assert.ok(sandboxState.commands.some((c) => c.id === 'm2'));
+});
+
+test('发布核算：引入新增同层重复的草案被拒绝（409 sandbox-conflicts）', () => {
+  // m3 改到 S 与 m2 同层重复；A 上下文还可见 root 的 S（m1）
+  let err;
+  try {
+    prepareSandboxCommit(sandboxState, { updates: [{ commandId: 'm3', sequence: 's' }] });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, '应当抛出异常');
+  assert.match(err.message, /冲突/);
+  assert.equal(err.status, 409);
+  assert.equal(err.code, 'sandbox-conflicts');
+  const dupGoals = err.details.introducedConflicts.filter((c) => c.type === 'duplicate').map((c) => c.goalId);
+  assert.ok(dupGoals.some((g) => g.includes('m2') && g.includes('m3')));
+  // 被拒绝后基线不变
+  assert.equal(sandboxState.commands.find((c) => c.id === 'm3').sequenceLabel, 'J');
+});
+
+test('发布核算：引入新增前缀冲突的草案被拒绝（409 sandbox-conflicts）', () => {
+  const st = {
+    contexts: [{ id: 'r', parentId: null, name: 'R' }],
+    commands: [
+      { id: 'p1', contextId: 'r', name: 'cmd-j', sequenceTokens: ['j'], sequenceLabel: 'J', description: '' },
+      { id: 'p9', contextId: 'r', name: 'cmd-k', sequenceTokens: ['k'], sequenceLabel: 'K', description: '' },
+    ],
+  };
+  let err;
+  try {
+    prepareSandboxCommit(st, { updates: [{ commandId: 'p9', sequence: 'j l' }] });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, '应当抛出异常');
+  assert.equal(err.code, 'sandbox-conflicts');
+  assert.ok(err.details.introducedConflicts.some((c) => c.type === 'prefix'));
+});
+
+test('发布核算：冲突消解后的草案（无新增冲突）通过', () => {
+  const st = {
+    contexts: [{ id: 'r', parentId: null, name: 'R' }],
+    commands: [
+      { id: 'x1', contextId: 'r', name: 'x1', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+      { id: 'x2', contextId: 'r', name: 'x2', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+    ],
+  };
+  const draft = { updates: [{ commandId: 'x2', sequence: 'q' }] }; // 重复消解
+  const { simState, summary } = prepareSandboxCommit(st, draft);
+  assert.equal(summary.updates, 1);
+  assert.equal(computeEffective(simState, 'r').conflicts.length, 0);
+});
+
+test('发布核算：非法草案仍按预演口径拒绝（400）', () => {
+  let err;
+  try {
+    prepareSandboxCommit(sandboxState, { deletes: ['nope'] });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, '应当抛出异常');
+  assert.match(err.message, /不存在/);
+  assert.equal(err.status, 400);
+  assert.equal(err.code, undefined);
+});
+
+test('失效操作检查：数据漂移后列出失效的新增/改序列/删除', () => {
+  const draft = {
+    adds: [{ draftId: 'd1', contextId: 'a', name: 'n', sequence: 'n' }],
+    updates: [{ commandId: 'm3', sequence: 'q' }],
+    deletes: ['m2'],
+  };
+  // 当前状态：全部有效
+  assert.equal(inspectDraftOps(sandboxState, draft).invalidCount, 0);
+  // 漂移状态：上下文 a、命令 m2 被删，m3 被改 id 仍在但删除一个不存在的命令
+  const drifted = {
+    contexts: sandboxState.contexts.filter((c) => c.id !== 'a'),
+    commands: sandboxState.commands.filter((c) => c.id === 'm1'),
+  };
+  const res = inspectDraftOps(drifted, draft);
+  assert.equal(res.invalidCount, 3);
+  assert.equal(res.invalid.adds.length, 1);
+  assert.match(res.invalid.adds[0].reason, /上下文已不存在/);
+  assert.equal(res.invalid.updates.length, 1);
+  assert.match(res.invalid.updates[0].reason, /命令已不存在/);
+  assert.equal(res.invalid.deletes.length, 1);
 });
 
 // ---------- 冲突消解（改键方案搜索） ----------

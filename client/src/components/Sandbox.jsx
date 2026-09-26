@@ -129,9 +129,12 @@ function DiffSection({ title, diff, kind }) {
 export default function Sandbox({ state, onRefresh }) {
   const [draft, setDraft] = useState(loadDraft);
   const [preview, setPreview] = useState(null);
+  const [previewedKey, setPreviewedKey] = useState(''); // 当前预演结果对应的草案快照
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [running, setRunning] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [staleInfo, setStaleInfo] = useState(null); // 发布被拒（基线过期）时后端返回的失效操作
   const [ctxId, setCtxId] = useState('');
   const [addForm, setAddForm] = useState({ name: '', sequence: '', description: '' });
 
@@ -198,10 +201,14 @@ export default function Sandbox({ state, onRefresh }) {
   const runPreview = useCallback(async (d) => {
     setRunning(true);
     try {
-      setPreview(await api.sandboxPreview(d));
+      const result = await api.sandboxPreview(d);
+      setPreview(result);
+      setPreviewedKey(JSON.stringify(d));
+      setStaleInfo(null);
       setError('');
     } catch (err) {
       setPreview(null);
+      setPreviewedKey('');
       setError(err.message);
     } finally {
       setRunning(false);
@@ -280,7 +287,57 @@ export default function Sandbox({ state, onRefresh }) {
     if (!window.confirm('确定清空全部草案操作？仅清除浏览器中的草案，不会影响服务器数据。')) return;
     setDraft(emptyDraft());
     setPreview(null);
+    setStaleInfo(null);
     setNotice('草案已清空。');
+  };
+
+  // ---- 发布 ----
+  // 只有「当前草案已成功预演（预演结果与草案一一对应）且不引入新增 duplicate/prefix 冲突」才允许发布
+  const conflictAdds = preview ? preview.stats.duplicateAppeared + preview.stats.prefixAppeared : 0;
+  const previewMatchesDraft = !!preview && previewedKey === JSON.stringify(draft);
+  const canPublish = !isEmpty && previewMatchesDraft && conflictAdds === 0 && !running && !publishing;
+  const publishBlockReason = isEmpty
+    ? '草案为空，无可发布内容'
+    : running
+      ? '预演计算中…'
+      : !previewMatchesDraft
+        ? '草案尚未成功预演（或预演后草案又有改动），请先重新预演'
+        : conflictAdds > 0
+          ? `草案会引入 ＋${conflictAdds} 个新的同层重复/前缀冲突，请先调整草案（可借助审校页的冲突消解）`
+          : '';
+
+  const publish = async () => {
+    if (!canPublish) return;
+    const ok = window.confirm(
+      `确定发布当前草案？\n新增 ${draft.adds.length} 条、改序列 ${draft.updates.length} 条、删除 ${draft.deletes.length} 条，` +
+        `将一次性写入服务器数据（预演基线指纹 ${preview.baselineFingerprint.slice(0, 12)}…）。`,
+    );
+    if (!ok) return;
+    setPublishing(true);
+    setError('');
+    try {
+      const result = await api.sandboxPublish(draft, preview.baselineFingerprint);
+      const { counts } = result;
+      setDraft(emptyDraft()); // 发布成功：清空本地草案
+      setPreview(null);
+      setPreviewedKey('');
+      setStaleInfo(null);
+      setNotice(
+        `✅ 发布成功：新增 ${counts.adds} 条、改序列 ${counts.updates} 条、删除 ${counts.deletes} 条命令已写入。` +
+          `新版本指纹 ${result.fingerprint.slice(0, 12)}…`,
+      );
+      await onRefresh?.(); // 刷新审校状态（App 会联动刷新审校面板）
+    } catch (err) {
+      // 发布失败：草案保留，可修正后重新预演再发布
+      if (err.code === 'sandbox-stale') {
+        setStaleInfo(err.details || { invalid: { adds: [], updates: [], deletes: [] } });
+        setError(`⚠ ${err.message}（当前版本指纹 ${(err.details?.currentFingerprint || '').slice(0, 12)}…）`);
+      } else {
+        setError(err.message);
+      }
+    } finally {
+      setPublishing(false);
+    }
   };
 
   const downloadJson = () => {
@@ -314,6 +371,14 @@ export default function Sandbox({ state, onRefresh }) {
           <button onClick={() => runPreview(draft)} disabled={isEmpty || running}>
             {running ? '预演中…' : '重新预演'}
           </button>
+          <button
+            className="primary"
+            onClick={publish}
+            disabled={!canPublish}
+            title={canPublish ? '把当前草案一次性写入服务器数据' : publishBlockReason}
+          >
+            {publishing ? '发布中…' : '🚀 发布草案'}
+          </button>
           <button className="primary" onClick={downloadJson} disabled={!preview}>
             下载预演 JSON
           </button>
@@ -322,6 +387,57 @@ export default function Sandbox({ state, onRefresh }) {
           </button>
         </div>
       </div>
+
+      {preview && previewMatchesDraft && (
+        <p className="dim small sandbox-baseline">
+          预演基线指纹：<code>{preview.baselineFingerprint.slice(0, 12)}…</code>
+          {conflictAdds > 0
+            ? ` · ⚠ 草案会引入 ＋${conflictAdds} 个新冲突，不可发布`
+            : ' · 预演无新增冲突，可发布'}
+        </p>
+      )}
+
+      {staleInfo && (
+        <div className="sandbox-stale">
+          <strong>⚠ 发布被拒：数据已变化，预演基线已过期。</strong>
+          <span>
+            当前版本指纹 <code>{(staleInfo.currentFingerprint || '').slice(0, 12)}…</code>
+            {staleInfo.invalidCount > 0
+              ? `，其中 ${staleInfo.invalidCount} 条草案操作已失效（目标命令/上下文不存在），请重新预演后再发布：`
+              : '，草案操作本身仍然有效，请重新预演后再发布。'}
+          </span>
+          {staleInfo.invalidCount > 0 && (
+            <ul>
+              {staleInfo.invalid.adds.map((op, i) => (
+                <li key={`sa-${i}`}>＋新增：{op.reason}</li>
+              ))}
+              {staleInfo.invalid.updates.map((op, i) => (
+                <li key={`su-${i}`}>✎改序列：{op.reason}</li>
+              ))}
+              {staleInfo.invalid.deletes.map((op, i) => (
+                <li key={`sd-${i}`}>−删除：{op.reason}</li>
+              ))}
+            </ul>
+          )}
+          <div className="sandbox-stale-actions">
+            <button
+              className="primary"
+              onClick={async () => {
+                const hadInvalid = staleInfo.invalidCount > 0;
+                setStaleInfo(null);
+                await onRefresh?.();
+                // 有失效操作时：刷新数据后下方 effect 会自动剔除失效草案，草案变化即自动重新预演；
+                // 无失效操作时直接基于最新数据重新预演。
+                if (!hadInvalid) runPreview(draft);
+              }}
+              disabled={running}
+            >
+              立即重新预演
+            </button>
+            <button onClick={() => setStaleInfo(null)}>知道了</button>
+          </div>
+        </div>
+      )}
 
       {notice && (
         <p className="sandbox-notice">
@@ -491,10 +607,23 @@ export default function Sandbox({ state, onRefresh }) {
           <h2>
             ③ 预演结果 <span className="sub">基线 vs 应用草案后的模拟状态</span>
           </h2>
-          <button className="primary" onClick={downloadJson} disabled={!preview}>
-            下载预演 JSON
-          </button>
+          <div className="panel-header-actions">
+            <button
+              className="primary"
+              onClick={publish}
+              disabled={!canPublish}
+              title={canPublish ? '把当前草案一次性写入服务器数据' : publishBlockReason}
+            >
+              {publishing ? '发布中…' : '🚀 发布草案'}
+            </button>
+            <button className="primary" onClick={downloadJson} disabled={!preview}>
+              下载预演 JSON
+            </button>
+          </div>
         </div>
+        {!isEmpty && !canPublish && publishBlockReason && !running && (
+          <p className="hint">🔒 暂不可发布：{publishBlockReason}</p>
+        )}
         {isEmpty && <p className="hint">草案为空：暂存操作后自动生成预演，对比基线与模拟状态的差异。</p>}
         {!isEmpty && !preview && !error && <p className="hint">预演计算中…</p>}
         {preview && (
@@ -529,6 +658,14 @@ export default function Sandbox({ state, onRefresh }) {
 
             {preview.stats.totalChanges === 0 && (
               <p className="hint">✅ 草案与基线完全一致：没有产生任何差异。</p>
+            )}
+
+            {conflictAdds > 0 && (
+              <p className="error sandbox-conflict-block">
+                ⚠ 草案会引入 ＋{conflictAdds} 个新的同层重复/前缀冲突（同层重复 ＋
+                {preview.stats.duplicateAppeared}、前缀冲突 ＋{preview.stats.prefixAppeared}
+                ），发布已被阻止。请调整草案后重新预演，或使用审校页的「冲突消解」生成改键方案。
+              </p>
             )}
 
             {preview.unreachable.appeared.length + preview.unreachable.disappeared.length > 0 && (

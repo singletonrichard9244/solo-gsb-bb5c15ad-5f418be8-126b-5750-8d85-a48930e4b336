@@ -133,6 +133,7 @@ app.get('/api/regression-suite', (req, res, next) => {
 // ---- 变更沙盒预演（只读：在内存副本上应用草案并对比基线，绝不写回数据文件） ----
 // POST body 即草案：{ adds: [{draftId?, contextId, name, sequence, description?}],
 //                     updates: [{commandId, sequence}], deletes: [commandId, ...] }
+// 响应携带 baselineFingerprint（基线版本指纹），发布时需原样回传。
 app.post(
   '/api/sandbox/preview',
   wrap((req, res) => {
@@ -141,6 +142,25 @@ app.post(
       res.setHeader('Content-Disposition', 'attachment; filename="sandbox-preview.json"');
     }
     res.json(result);
+  }),
+);
+
+// ---- 变更沙盒发布（在单次写临界区内核对指纹、复用草案校验并原子写入） ----
+// POST body: { draft: {...}, fingerprint: "<预演返回的 baselineFingerprint>" }
+// - 指纹与当前数据不一致：409 sandbox-stale，返回当前指纹与失效操作，不落盘；
+// - 草案非法：400；草案引入新增 duplicate/prefix 冲突：409 sandbox-conflicts；
+// - 全部通过：原子写入并返回新增/改序列/删除数量与新版本指纹。
+app.post(
+  '/api/sandbox/publish',
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const draft = body.draft && typeof body.draft === 'object' ? body.draft : body;
+    const fingerprint = body.fingerprint;
+    if (typeof fingerprint !== 'string' || !fingerprint) {
+      throw Object.assign(new Error('发布需要携带预演返回的基线指纹 fingerprint'), { status: 400 });
+    }
+    const result = await store.commitSandboxDraft(draft, fingerprint);
+    res.json({ publishedAt: new Date().toISOString(), ...result });
   }),
 );
 
@@ -162,7 +182,10 @@ app.post(
 
 // ---- 错误处理 ----
 app.use('/api', (err, req, res, next) => {
-  res.status(err.status || 500).json({ error: err.message || '服务器内部错误' });
+  const body = { error: err.message || '服务器内部错误' };
+  if (err.code) body.code = err.code;
+  if (err.details) body.details = err.details;
+  res.status(err.status || 500).json(body);
 });
 
 // ---- 生产环境托管前端构建产物 ----
@@ -177,9 +200,18 @@ if (fs.existsSync(clientDist)) {
 
 const PORT = Number(process.env.PORT) || 3000;
 
-store.init().then((mode) => {
-  app.listen(PORT, () => {
-    console.log(`[shortcut-console] 数据初始化：${mode}`);
-    console.log(`[shortcut-console] 服务已启动: http://localhost:${PORT}`);
+function start(port = PORT) {
+  return store.init().then((mode) => {
+    const server = app.listen(port, () => {
+      console.log(`[shortcut-console] 数据初始化：${mode}`);
+      console.log(`[shortcut-console] 服务已启动: http://localhost:${port}`);
+    });
+    return { server, mode };
   });
-});
+}
+
+if (require.main === module) {
+  start();
+}
+
+module.exports = { app, start };

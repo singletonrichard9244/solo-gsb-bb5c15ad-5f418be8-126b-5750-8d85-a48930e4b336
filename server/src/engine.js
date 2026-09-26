@@ -6,6 +6,8 @@
  * - 被更深层同序列覆盖的祖先绑定标记为 shadowed（不生效）
  */
 
+const { createHash } = require('node:crypto');
+
 const MAX_PRESSES = 3;
 
 const MODIFIERS = new Set(['ctrl', 'alt', 'shift', 'meta']);
@@ -1026,6 +1028,28 @@ function pressToPretty(token) {
 /* ================= 变更沙盒预演 ================= */
 
 /**
+ * 状态基线版本指纹：对规范化后的状态（上下文 + 命令，键序固定）取 SHA-256。
+ * 预演响应携带该指纹；发布时在同一临界区内重新核对，数据已变化则拒绝发布。
+ * 只依赖状态内容，与数组顺序无关（上下文/命令均先按 id 排序）。
+ */
+function stateFingerprint(state) {
+  const contexts = (state?.contexts || [])
+    .map((c) => ({ id: c.id, parentId: c.parentId ?? null, name: c.name, description: c.description || '' }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const commands = (state?.commands || [])
+    .map((c) => ({
+      id: c.id,
+      contextId: c.contextId,
+      name: c.name,
+      description: c.description || '',
+      sequenceTokens: [...c.sequenceTokens],
+      sequenceLabel: c.sequenceLabel,
+    }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return createHash('sha256').update(JSON.stringify({ contexts, commands })).digest('hex');
+}
+
+/**
  * 把草案（新增 / 改序列 / 删除）应用到状态副本上，返回模拟状态。
  * 纯内存计算：不触碰持久化数据，也不修改传入的 baseState；
  * 所有校验失败均抛出 400，保证非法草案不会产生任何副作用。
@@ -1284,11 +1308,101 @@ function previewSandbox(baseState, draft) {
 
   return {
     generatedAt: new Date().toISOString(),
+    baselineFingerprint: stateFingerprint(baseState),
     draft: summary,
     stats,
     contexts: contextDiffs,
     unreachable,
   };
+}
+
+/**
+ * 检查草案操作在当前状态下是否仍然有效（只读，不产生副作用）。
+ * 与 applyDraft 的校验口径一致，但只针对「目标已不存在 / 与现有数据冲突」这类
+ * 数据漂移导致的失效，用于发布被拒时向前端报告失效操作。
+ * 返回 { invalidCount, invalid: { adds, updates, deletes } }。
+ */
+function inspectDraftOps(baseState, draft) {
+  const d = draft || {};
+  const adds = Array.isArray(d.adds) ? d.adds : [];
+  const updates = Array.isArray(d.updates) ? d.updates : [];
+  const deletes = Array.isArray(d.deletes) ? d.deletes : [];
+
+  const contextIds = new Set((baseState.contexts || []).map((c) => c.id));
+  const commandIds = new Set((baseState.commands || []).map((c) => c.id));
+
+  const invalidAdds = [];
+  for (const a of adds) {
+    const draftId = a && typeof a.draftId === 'string' && a.draftId.trim() ? a.draftId.trim() : null;
+    const name = a && a.name ? String(a.name).trim() : '';
+    const label = name || draftId || '(未命名新增)';
+    if (!a || typeof a !== 'object' || !contextIds.has(a.contextId)) {
+      invalidAdds.push({ draftId, name: name || null, reason: `新增命令「${label}」的目标上下文已不存在` });
+    } else if (draftId && commandIds.has(draftId)) {
+      invalidAdds.push({ draftId, name: name || null, reason: `新增命令「${label}」的 id 与现有命令冲突` });
+    }
+  }
+
+  const invalidUpdates = [];
+  for (const u of updates) {
+    const id = u && typeof u.commandId === 'string' ? u.commandId : null;
+    if (!id || !commandIds.has(id)) {
+      invalidUpdates.push({ commandId: id, reason: `要修改序列的命令已不存在：${id || '(缺少 commandId)'}` });
+    }
+  }
+
+  const invalidDeletes = [];
+  for (const raw of deletes) {
+    const id = typeof raw === 'string' ? raw : raw && raw.commandId;
+    if (!id || !commandIds.has(id)) {
+      invalidDeletes.push({ commandId: id || null, reason: `要删除的命令已不存在：${id || '(缺少命令 id)'}` });
+    }
+  }
+
+  return {
+    invalidCount: invalidAdds.length + invalidUpdates.length + invalidDeletes.length,
+    invalid: { adds: invalidAdds, updates: invalidUpdates, deletes: invalidDeletes },
+  };
+}
+
+/**
+ * 发布前核算（须在调用方的临界区内执行）：
+ * 1. 复用与预演完全一致的草案校验（applyDraft 经由 previewSandbox 全量校验，
+ *    非法草案抛 400，绝不产生任何副作用）；
+ * 2. 拒绝引入任何新增 duplicate / prefix 冲突的草案（抛 409，details 携带冲突清单）；
+ * 3. 通过全部校验后返回模拟状态与草案摘要，由调用方原子写入。
+ * 纯内存计算：不修改传入的 baseState。
+ */
+function prepareSandboxCommit(baseState, draft) {
+  const preview = previewSandbox(baseState, draft); // 复用草案校验，非法草案在此抛 400
+  const { state: simState, draftOps, summary } = applyDraft(baseState, draft);
+
+  const introduced = [];
+  const seen = new Set();
+  for (const ctx of preview.contexts) {
+    for (const c of [...ctx.duplicate.appeared, ...ctx.prefix.appeared]) {
+      if (seen.has(c.goalId)) continue;
+      seen.add(c.goalId);
+      introduced.push(c);
+    }
+  }
+  if (introduced.length > 0) {
+    introduced.sort((a, b) => (a.goalId < b.goalId ? -1 : a.goalId > b.goalId ? 1 : 0));
+    throw Object.assign(
+      new Error(`草案会引入 ${introduced.length} 个新的同层重复/前缀冲突，已拒绝发布`),
+      {
+        status: 409,
+        code: 'sandbox-conflicts',
+        details: {
+          introducedConflicts: introduced,
+          duplicateAppeared: preview.stats.duplicateAppeared,
+          prefixAppeared: preview.stats.prefixAppeared,
+        },
+      },
+    );
+  }
+
+  return { simState, draftOps, summary, preview };
 }
 
 /* ================= 冲突消解（改键方案搜索） ================= */
@@ -1850,5 +1964,8 @@ module.exports = {
   generateRegressionSuite,
   applyDraft,
   previewSandbox,
+  stateFingerprint,
+  inspectDraftOps,
+  prepareSandboxCommit,
   resolveConflicts,
 };
